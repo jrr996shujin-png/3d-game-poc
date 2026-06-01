@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>森林追逐 — AI 生成 3D 游戏 POC</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a1f1c; overflow: hidden; font-family: -apple-system, "PingFang SC", sans-serif; color: #e6edd7; }
+  #canvas { display: block; }
+  #hud { position: fixed; top: 14px; left: 14px; padding: 12px 16px; background: rgba(0,0,0,.6); border-radius: 8px; font-size: 14px; line-height: 1.7; pointer-events: none; min-width: 200px; }
+  #hud .big { font-size: 28px; font-weight: 700; color: #ffdf6c; }
+  #hud .row { display: flex; justify-content: space-between; gap: 16px; }
+  #hud .label { opacity: .7; }
+  #hud .val { font-weight: 600; }
+  #hud .val.bad { color: #ff9292; }
+  #hud .val.good { color: #88e788; }
+  #help { position: fixed; bottom: 14px; left: 14px; padding: 8px 12px; background: rgba(0,0,0,.55); border-radius: 8px; font-size: 12px; line-height: 1.5; pointer-events: none; opacity: .9; }
+  #help kbd { background: #2c3329; padding: 1px 6px; border-radius: 3px; font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+  #loading, #overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 14px; background: rgba(0,0,0,.88); font-size: 22px; z-index: 10; }
+  #overlay { display: none; }
+  #overlay .title { font-size: 42px; font-weight: 800; }
+  #overlay .title.win { color: #ffdf6c; }
+  #overlay .title.lose { color: #ff7373; }
+  #overlay button { margin-top: 12px; padding: 10px 28px; background: #3a5a2a; border: none; color: white; font-size: 16px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+  #overlay button:hover { background: #4a7a3a; }
+  #loading .progress { font-size: 14px; opacity: .7; }
+  #wolf-warn { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 80px; opacity: 0; pointer-events: none; transition: opacity .15s; text-shadow: 0 0 20px red; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="hud">
+  <div class="row"><span class="label">距离</span><span class="big" id="distance">0m</span></div>
+  <div class="row" style="font-size:13px;"><span class="label">终点</span><span class="val">200m</span></div>
+  <div class="row"><span class="label">狼距离</span><span class="val bad" id="wolf-dist">5m</span></div>
+  <div class="row"><span class="label">冲刺</span><span class="val good" id="sprint">就绪</span></div>
+</div>
+
+<div id="help">
+  <kbd>A</kbd><kbd>D</kbd> 左右换道 · <kbd>W</kbd> 冲刺（1s, 冷却 5s）· <kbd>M</kbd> 静音 <span id="mute-ind">🔊</span><br>
+  📱 <strong>手机：左/右滑换道，上滑冲刺</strong> · 撞树石 = 狼逼近 1.5m · <span style="color:#ff7373">越远狼追得越凶</span>
+</div>
+
+<div id="wolf-warn">⚠</div>
+
+<div id="loading">
+  <div>加载 AI 生成的 3D 资产中…</div>
+  <div class="progress" id="loading-progress">0 / 6</div>
+</div>
+
+<div id="overlay">
+  <div class="title" id="overlay-title">—</div>
+  <div id="overlay-msg"></div>
+  <button onclick="location.reload()">再玩一局</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ───────── Scene ─────────
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('canvas'), antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9bc4b0);
+scene.fog = new THREE.Fog(0x9bc4b0, 30, 90);
+
+const camera = new THREE.PerspectiveCamera(65, innerWidth/innerHeight, 0.1, 200);
+
+// Lights
+const sun = new THREE.DirectionalLight(0xfff4e0, 2.8);
+sun.position.set(20, 30, 10);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -30; sun.shadow.camera.right = 30;
+sun.shadow.camera.top = 50; sun.shadow.camera.bottom = -10;
+sun.shadow.camera.near = 0.5; sun.shadow.camera.far = 100;
+scene.add(sun);
+scene.add(new THREE.AmbientLight(0xb0c7d4, 1.0));
+scene.add(new THREE.HemisphereLight(0xffffff, 0x4a5d3a, 0.5));
+
+// Endless ground with AI-generated tileable grass texture (Flux, 1024×1024)
+const grassTex = new THREE.TextureLoader().load('assets/grass_tile.png');
+grassTex.wrapS = grassTex.wrapT = THREE.RepeatWrapping;
+grassTex.repeat.set(10, 200);                  // 20m × 400m ground → ~2m per tile
+grassTex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+grassTex.colorSpace = THREE.SRGBColorSpace;
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(20, 400),
+  new THREE.MeshStandardMaterial({ map: grassTex, roughness: 1 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.position.z = -150;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ───────── Asset Loader ─────────
+const loader = new GLTFLoader();
+const loadingEl = document.getElementById('loading-progress');
+let loaded = 0;
+const total = 6;
+function loadGLB(url, withAnimations = false) {
+  return new Promise((resolve, reject) => {
+    loader.load(url, (g) => {
+      loaded++; loadingEl.textContent = `${loaded} / ${total}`;
+      g.scene.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+      resolve(withAnimations ? { scene: g.scene, animations: g.animations || [] } : g.scene);
+    }, undefined, reject);
+  });
+}
+
+function normalize(model, targetHeight, name) {
+  const box = new THREE.Box3().setFromObject(model);
+  const size = new THREE.Vector3(); box.getSize(size);
+  const center = new THREE.Vector3(); box.getCenter(center);
+  const scale = targetHeight / size.y;
+  model.position.set(-center.x, -box.min.y, -center.z);
+  const wrap = new THREE.Group();
+  wrap.add(model);
+  wrap.scale.setScalar(scale);
+  console.log(`[asset] ${name}: h=${targetHeight}m (scale ${scale.toFixed(3)})`);
+  return wrap;
+}
+
+// All assets self-contained in repo for GitHub Pages deployment.
+// villager_running_anim.glb = Meshy Auto-Rigging output with embedded running clip.
+// tripo/*.glb = static Tripo image-to-3D outputs.
+const [villagerPack, wolfRaw, chestRaw, treeRaw, rockRaw] = await Promise.all([
+  loadGLB('assets/villager_running_anim.glb', true),
+  loadGLB('assets/tripo/wolf.glb'),
+  loadGLB('assets/tripo/chest.glb'),
+  loadGLB('assets/tripo/tree.glb'),
+  loadGLB('assets/tripo/rock.glb'),
+]);
+const villagerRaw = villagerPack.scene;
+const villagerClips = villagerPack.animations;
+console.log('[anim] villager clips:', villagerClips.map(c => `${c.name}(${c.duration.toFixed(2)}s)`));
+
+// ───────── Build Runtime Entities ─────────
+const player = new THREE.Group();
+const villager = normalize(villagerRaw, 1.85, 'villager');
+player.add(villager);
+player.position.set(0, 0, 0);
+scene.add(player);
+const warrior = villager;  // alias
+
+// Skeletal animation — play running clip on loop
+let villagerMixer = null;
+if (villagerClips.length > 0) {
+  villagerMixer = new THREE.AnimationMixer(villagerRaw);
+  // Pick the running clip (Meshy returns 'Running' or similar)
+  const clip = villagerClips.find(c => /run/i.test(c.name)) || villagerClips[0];
+  const action = villagerMixer.clipAction(clip);
+  action.setLoop(THREE.LoopRepeat).play();
+  console.log('[anim] playing:', clip.name);
+}
+
+// Wolf chaser, always behind
+const wolf = normalize(wolfRaw, 1.2, 'wolf');
+wolf.position.set(0, 0, 6);   // 6m behind
+scene.add(wolf);
+
+// Chest at finish line (200m forward)
+const chest = normalize(chestRaw, 1.2, 'chest');
+chest.position.set(0, 0, -200);
+scene.add(chest);
+// glow around chest so player sees it from afar
+const chestGlow = new THREE.PointLight(0xffdf6c, 4, 15);
+chestGlow.position.copy(chest.position).add(new THREE.Vector3(0, 1.5, 0));
+scene.add(chestGlow);
+
+// Tree + rock prefabs (cached normalized wrappers)
+const treePrefab = normalize(treeRaw, 5.5, 'tree');
+const rockPrefab = normalize(rockRaw, 0.9, 'rock');
+
+// ───────── Obstacles (3-lane endless runner) ─────────
+const LANES = [-3, 0, 3];        // x positions for left / center / right lanes
+const PLAYER_RADIUS = 0.6;       // collision radius
+
+const obstacles = [];            // { mesh, lane, z, radius }
+function spawnObstacleAt(zPos) {
+  const lane = Math.floor(Math.random() * 3);
+  const useTree = Math.random() < 0.55;
+  const prefab = useTree ? treePrefab : rockPrefab;
+  const m = prefab.clone(true);
+  m.position.set(LANES[lane] + (Math.random() - 0.5) * 0.6, 0, zPos);
+  m.rotation.y = Math.random() * Math.PI * 2;
+  const jitter = 0.85 + Math.random() * 0.3;
+  m.scale.multiplyScalar(jitter);
+  scene.add(m);
+  obstacles.push({ mesh: m, lane, z: zPos, radius: useTree ? 0.8 : 0.7 });
+}
+
+// Pre-seed obstacles from current z down to finish line, with some spacing.
+let lastSpawnZ = -8;
+function fillObstaclesAhead(uptoZ) {
+  while (lastSpawnZ > uptoZ) {
+    lastSpawnZ -= 4 + Math.random() * 3;   // gap 4-7m
+    if (lastSpawnZ > -195) spawnObstacleAt(lastSpawnZ);  // stop spawning near finish
+  }
+}
+fillObstaclesAhead(-200);
+
+// Side trees for ambience (off-lane, just visual flanking)
+for (let z = -10; z > -200; z -= 6) {
+  for (const sx of [-10, 10]) {
+    const t = treePrefab.clone(true);
+    t.position.set(sx + (Math.random() - 0.5) * 3, 0, z + (Math.random() - 0.5) * 3);
+    t.rotation.y = Math.random() * Math.PI * 2;
+    t.scale.multiplyScalar(0.9 + Math.random() * 0.4);
+    scene.add(t);
+  }
+}
+
+// ───────── Camera (chase cam, low behind player) ─────────
+function updateCamera() {
+  camera.position.set(player.position.x * 0.5, 2.4, player.position.z + 5);
+  camera.lookAt(player.position.x, 1.2, player.position.z - 5);
+}
+
+// ───────── Audio (synthesized chase BGM, no external assets) ─────────
+let audio = null;
+function initAudio() {
+  if (audio) return audio;
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const master = ctx.createGain();
+  master.gain.value = 0.35;
+  master.connect(ctx.destination);
+
+  const playTone = (freq, t, dur, type = 'square', vol = 0.15) => {
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(vol, t + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g).connect(master);
+    o.start(t); o.stop(t + dur + 0.05);
+  };
+
+  const playNoise = (t, dur, vol = 0.04) => {
+    const buf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * dur), ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    src.connect(g).connect(master);
+    src.start(t);
+  };
+
+  // Chase pattern in C minor — 8 sixteenths per bar, 140 BPM, loops forever.
+  // Notes: C minor scale  C4=261.6  Eb4=311.1  G4=392.0  Bb4=466.2  C5=523.3
+  const C2 = 65.4, G2 = 98.0, C3 = 130.8, Eb3 = 155.6, G3 = 196.0;
+  const C4 = 261.6, Eb4 = 311.1, G4 = 392.0, Bb4 = 466.2, C5 = 523.3;
+  const bpm = 140, beat = 60 / bpm, sixteenth = beat / 4;
+  const bar = beat * 4;
+  // Melody: 16 sixteenth notes per 2-bar phrase
+  const phrase = [
+    C4, Eb4, G4, C5,  Bb4, G4, Eb4, G4,
+    C4, Eb4, G4, Bb4, C5,  Bb4, G4, Eb4,
+  ];
+  const bassPhrase = [C2, 0, 0, 0, G2, 0, 0, 0, C2, 0, 0, 0, Eb3, 0, 0, 0];
+
+  let muted = false;
+  let lookahead = 0.2;       // schedule 0.2s of audio at a time
+  let nextNoteTime = 0;
+  function scheduleLoop() {
+    if (muted) { setTimeout(scheduleLoop, 100); return; }
+    const now = ctx.currentTime;
+    while (nextNoteTime < now + lookahead) {
+      const stepIndex = Math.floor((nextNoteTime / sixteenth)) % phrase.length;
+      // Melody (every 16th)
+      playTone(phrase[stepIndex], nextNoteTime, sixteenth * 0.95, 'square', 0.10);
+      // Bass (sparse)
+      if (bassPhrase[stepIndex] > 0) {
+        playTone(bassPhrase[stepIndex], nextNoteTime, beat * 0.6, 'sawtooth', 0.18);
+      }
+      // Hat (every 8th)
+      if (stepIndex % 2 === 0) playNoise(nextNoteTime, 0.04);
+      nextNoteTime += sixteenth;
+    }
+    setTimeout(scheduleLoop, 50);
+  }
+
+  audio = {
+    ctx,
+    start() {
+      if (ctx.state === 'suspended') ctx.resume();
+      if (nextNoteTime === 0) { nextNoteTime = ctx.currentTime + 0.1; scheduleLoop(); }
+    },
+    toggleMute() {
+      muted = !muted;
+      master.gain.value = muted ? 0 : 0.35;
+      document.getElementById('mute-ind').textContent = muted ? '🔇' : '🔊';
+    },
+    isMuted: () => muted,
+    playHit() {
+      // Quick low thud
+      playTone(80, ctx.currentTime, 0.18, 'sawtooth', 0.4);
+      playNoise(ctx.currentTime, 0.15, 0.2);
+    },
+    playWin() {
+      const t = ctx.currentTime;
+      // ascending fanfare
+      playTone(C4, t,        0.15, 'triangle', 0.2);
+      playTone(Eb4, t + 0.15, 0.15, 'triangle', 0.2);
+      playTone(G4, t + 0.30, 0.15, 'triangle', 0.2);
+      playTone(C5, t + 0.45, 0.40, 'triangle', 0.25);
+    },
+  };
+  return audio;
+}
+
+// ───────── Input ─────────
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (!audio) initAudio().start();   // bootstrap audio on first key (autoplay policy)
+  if (e.code === 'KeyM') audio?.toggleMute();
+});
+addEventListener('keyup',   e => { keys[e.code] = false; });
+
+// ── Mobile / touch: swipe left/right to change lane, swipe up to sprint ──
+let touchStartX = 0, touchStartY = 0, touchStartTime = 0;
+addEventListener('touchstart', e => {
+  if (e.touches.length !== 1) return;
+  touchStartX = e.touches[0].clientX;
+  touchStartY = e.touches[0].clientY;
+  touchStartTime = performance.now();
+  if (!audio) initAudio().start();
+}, { passive: true });
+addEventListener('touchend', e => {
+  if (!e.changedTouches.length) return;
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  const dy = e.changedTouches[0].clientY - touchStartY;
+  const dur = performance.now() - touchStartTime;
+  if (dur > 600) return;                              // too slow = not a swipe
+  const absX = Math.abs(dx), absY = Math.abs(dy);
+  const threshold = 30;
+  if (absX > absY && absX > threshold) {
+    // horizontal swipe — synthetic key press for one frame
+    const code = dx > 0 ? 'KeyD' : 'KeyA';
+    keys[code] = true;
+    setTimeout(() => { keys[code] = false; keys._aHandled = false; keys._dHandled = false; }, 50);
+  } else if (-dy > threshold) {
+    // upward swipe = sprint
+    keys['KeyW'] = true;
+    setTimeout(() => { keys['KeyW'] = false; }, 80);
+  }
+}, { passive: true });
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// ───────── Game State ─────────
+let baseSpeed = 6.5;             // m/s forward
+let speedMult = 1;               // sprint multiplier
+let currentLane = 1;             // 0=left, 1=center, 2=right
+let currentX = 0;
+let laneTrans = {                // smooth lane transition state
+  from: 0, to: 0, t: 1, dur: 0.22,  // t in [0,1], 1=done
+};
+let leanZ = 0;                   // body lean during turn (visual flourish)
+let distanceTraveled = 0;        // forward distance (we move world, so this == -player.z)
+const startTime = performance.now();
+let gameOver = false;
+let sprintActive = 0;
+let sprintCooldown = 0;
+const wolfChase = { dist: 6, isChasing: true };   // dist behind player
+
+// Restart-safe shortcut for keys
+function pressed(c) { return !!keys[c]; }
+
+const HUD = {
+  dist: document.getElementById('distance'),
+  wolf: document.getElementById('wolf-dist'),
+  sprint: document.getElementById('sprint'),
+  warn: document.getElementById('wolf-warn'),
+};
+
+function endGame(won, reason) {
+  if (gameOver) return;
+  gameOver = true;
+  const ov = document.getElementById('overlay');
+  const title = document.getElementById('overlay-title');
+  const msg = document.getElementById('overlay-msg');
+  if (won) {
+    title.textContent = '🎉 你跑赢了狼！';
+    title.className = 'title win';
+    msg.innerHTML = `跑了 <strong>${Math.round(distanceTraveled)}m</strong>，用时 ${((performance.now()-startTime)/1000).toFixed(1)}s`;
+    audio?.playWin();
+  } else {
+    title.textContent = '🐺 GAME OVER';
+    title.className = 'title lose';
+    msg.innerHTML = `${reason}<br>跑了 <strong>${Math.round(distanceTraveled)}m</strong> / 200m`;
+    audio?.playHit();
+  }
+  ov.style.display = 'flex';
+}
+
+// ───────── Game Loop ─────────
+function update(dt) {
+  if (gameOver) return;
+
+  // Lane switching — proper timed ease-in-out, with body lean into the turn
+  function startLaneSwitch(toLane) {
+    if (toLane === currentLane) return;
+    laneTrans.from = currentX;
+    laneTrans.to = LANES[toLane];
+    laneTrans.t = 0;
+    currentLane = toLane;
+  }
+  if (pressed('KeyA') && !keys._aHandled) { startLaneSwitch(Math.max(0, currentLane - 1)); keys._aHandled = true; }
+  if (!pressed('KeyA')) keys._aHandled = false;
+  if (pressed('KeyD') && !keys._dHandled) { startLaneSwitch(Math.min(2, currentLane + 1)); keys._dHandled = true; }
+  if (!pressed('KeyD')) keys._dHandled = false;
+  if (laneTrans.t < 1) {
+    laneTrans.t = Math.min(1, laneTrans.t + dt / laneTrans.dur);
+    // smoothstep ease-in-out: 3t² - 2t³
+    const e = laneTrans.t * laneTrans.t * (3 - 2 * laneTrans.t);
+    currentX = laneTrans.from + (laneTrans.to - laneTrans.from) * e;
+    // lean: positive Z rotation if moving right, neg if left; peaks mid-transition
+    const peak = Math.sin(laneTrans.t * Math.PI);
+    const dir = Math.sign(laneTrans.to - laneTrans.from);
+    leanZ = dir * peak * 0.25;
+  } else {
+    leanZ *= 0.85;   // decay any residual lean
+  }
+  warrior.rotation.z = leanZ;
+
+  // Sprint
+  if (pressed('KeyW') && sprintCooldown <= 0 && sprintActive <= 0) {
+    sprintActive = 1.0; sprintCooldown = 5.0;
+  }
+  if (sprintActive > 0) { sprintActive -= dt; speedMult = 1.85; }
+  else { speedMult = 1; sprintCooldown = Math.max(0, sprintCooldown - dt); }
+
+  HUD.sprint.textContent = sprintActive > 0 ? `冲刺中 ${sprintActive.toFixed(1)}s`
+                          : sprintCooldown > 0 ? `冷却 ${sprintCooldown.toFixed(1)}s`
+                          : '就绪';
+  HUD.sprint.className = sprintActive > 0 ? 'val good' : sprintCooldown > 0 ? 'val bad' : 'val good';
+
+  // Forward motion (player moves -Z direction)
+  const dz = baseSpeed * speedMult * dt;
+  player.position.z -= dz;
+  player.position.x = currentX;
+  distanceTraveled = -player.position.z;
+  HUD.dist.textContent = `${Math.round(distanceTraveled)}m`;
+
+  // Real skeletal animation drives limb motion — don't add extra body bob.
+  // Animation playback rate scales with sprint so legs visibly move faster.
+  if (villagerMixer) villagerMixer.update(dt * (sprintActive > 0 ? 1.8 : 1.2));
+
+  // Wolf chase: stays behind player, narrows when player slow / wider when sprinting
+  const wolfTargetZ = player.position.z + wolfChase.dist;
+  wolf.position.z += (wolfTargetZ - wolf.position.z) * Math.min(1, dt * 3);
+  wolf.position.x += (player.position.x - wolf.position.x) * Math.min(1, dt * 2.5);
+  // Wolf "runs" — keep its base facing (+π/2) + slight wobble
+  wolf.rotation.y = Math.PI / 2 + Math.sin(performance.now() * 0.02) * 0.1;
+
+  // Wolf distance dynamics — accelerating chase that ramps with distance traveled.
+  // Late-game (>100m), wolf is MUCH more aggressive.
+  const chaseRate = 0.6 + (distanceTraveled / 200) * 1.4;  // 0.6 → 2.0 m/s catchup
+  if (sprintActive > 0) wolfChase.dist = Math.min(12, wolfChase.dist + dt * 4);
+  else wolfChase.dist = Math.max(1.5, wolfChase.dist - dt * chaseRate);
+  HUD.wolf.textContent = `${wolfChase.dist.toFixed(1)}m`;
+  HUD.warn.style.opacity = wolfChase.dist < 3.5 ? '1' : '0';
+
+  // Caught condition
+  if (wolfChase.dist <= 1.5) { endGame(false, '保持距离 > 1.5m'); return; }
+
+  // Win condition
+  if (distanceTraveled >= 200) { endGame(true); return; }
+
+  // Collision with obstacles — penalty: wolf jumps 1.5m closer, red flash, audio thud.
+  // Each obstacle only triggers once (obs.dead).
+  for (const obs of obstacles) {
+    if (obs.dead) continue;
+    const dx = obs.mesh.position.x - player.position.x;
+    const dz = obs.mesh.position.z - player.position.z;
+    if (Math.abs(dz) < 1 && Math.abs(dx) < obs.radius + PLAYER_RADIUS) {
+      obs.dead = true;
+      wolfChase.dist = Math.max(1.6, wolfChase.dist - 1.5);
+      if (audio) audio.playHit();
+      // Brief red tint on the obstacle
+      obs.mesh.traverse(o => { if (o.isMesh && o.material?.color) {
+        if (o.userData._orig === undefined) o.userData._orig = o.material.color.getHex();
+        o.material.color.setHex(0xff5555);
+      }});
+      setTimeout(() => obs.mesh.traverse(o => {
+        if (o.isMesh && o.material?.color && o.userData._orig !== undefined)
+          o.material.color.setHex(o.userData._orig);
+      }), 220);
+    }
+  }
+
+  // Remove obstacles fully behind camera (perf)
+  for (let i = obstacles.length - 1; i >= 0; i--) {
+    if (obstacles[i].mesh.position.z > player.position.z + 10) {
+      scene.remove(obstacles[i].mesh);
+      obstacles.splice(i, 1);
+    }
+  }
+}
+
+// ───────── Main Loop ─────────
+let lastT = performance.now();
+document.getElementById('loading').style.display = 'none';
+// Face -Z direction (motion direction = away from camera, back to viewer).
+// Meshy rigged villager: natural forward is +Z → flip π so he faces -Z.
+// Tripo wolf + chest: natural forward +X → rotate +π/2.
+player.rotation.y = Math.PI;
+wolf.rotation.y = Math.PI / 2;
+chest.rotation.y = Math.PI / 2;
+
+function frame() {
+  const now = performance.now();
+  const dt = Math.min((now - lastT) / 1000, 0.05);
+  lastT = now;
+  update(dt);
+  updateCamera();
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+frame();
+</script>
+</body>
+</html>
